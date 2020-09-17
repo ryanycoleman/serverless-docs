@@ -1,0 +1,418 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Resources:
+  DocsearchIndexer:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContainerDefinitions:
+        - Image: registry.hub.docker.com/algolia/docsearch-scraper:latest
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref DocsearchIndexerLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: logs
+          Name: 0
+          Environment:
+            - Name: APPLICATION_ID
+              Value: !Ref EnvConfigAlgoliaAppIdAsString
+            - Name: SECRETS_NAMESPACE
+              Value: !Sub /${EnvironmentTagName}/
+      Cpu: 1024
+      ExecutionRoleArn: !GetAtt DocsearchIndexerExecutionRole.Arn
+      Memory: 2048
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      TaskRoleArn: !GetAtt DocsearchIndexerTaskRole.Arn
+      Volumes: []
+    DependsOn: DocsearchIndexerLogGroup
+  DocsearchIndexerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-DocsearchInde-execution
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: ecs-tasks.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DownloadDockerImagesFromECR
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:*:*:log-group:/stackery/task/${AWS::StackName}-*
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: '*'
+  DocsearchIndexerTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-DocsearchIndexer-task
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: ecs-tasks.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AccessSecrets
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsManager:GetSecretValue
+                Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/${EnvironmentTagName}/*
+  DocsearchIndexerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /stackery/task/${AWS::StackName}-DocsearchIndexer/logs
+  runIndexer:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-runIndexer
+      Description: !Sub
+        - Stack ${StackTagName} Environment ${EnvironmentTagName} Function ${ResourceName}
+        - ResourceName: runIndexer
+      CodeUri: functions/runIndexer
+      Handler: index.handler
+      Runtime: nodejs12.x
+      MemorySize: 1024
+      Timeout: 30
+      Tracing: Active
+      Policies:
+        - AWSXrayWriteOnlyAccess
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ecs:RunTask
+                - ecs:DescribeTasks
+                - ecs:StopTask
+              Resource:
+                - !Ref DocsearchIndexer
+                - !Sub arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task/*
+        - Statement:
+            - Effect: Allow
+              Action:
+                - iam:PassRole
+              Resource:
+                - !GetAtt DocsearchIndexerExecutionRole.Arn
+                - !GetAtt DocsearchIndexerTaskRole.Arn
+        - S3CrudPolicy:
+            BucketName: !Ref www
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/${EnvironmentTagName}/*
+      Environment:
+        Variables:
+          DOCKER_TASK_ARN: !Ref DocsearchIndexer
+          DOCKER_TASK_SUBNETS: !Join
+            - ','
+            - !Ref DefaultVPCSubnets
+          ALGOLIA_API_SECRET: !Sub /${EnvironmentTagName}/ALGOLIA_API_KEY
+          BUCKET_NAME: !Ref www
+          BUCKET_ARN: !GetAtt www.Arn
+          SECRETS_NAMESPACE: !Sub /${EnvironmentTagName}/
+  Website:
+    Type: AWS::CodeBuild::Project
+    Metadata:
+      StackeryType: website
+    DependsOn: WebsiteRole
+    Properties:
+      Name: !Sub ${AWS::StackName}-Website
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        Type: LINUX_CONTAINER
+        EnvironmentVariables: []
+      ServiceRole: !GetAtt WebsiteRole.Arn
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: !Sub
+          - |-
+            version: 0.2
+            phases:
+              install:
+                runtime-versions:
+                  nodejs: latest
+                  python: latest
+                  ruby: latest
+                commands:
+                  - |
+                    _SOURCE_LOCATION="${SourceLocation}"
+                    if [ s3 != "${!_SOURCE_LOCATION%%:*}" ]; then
+                      git clone "${SourceLocation}" repo
+                      cd repo
+                      git checkout "${SourceVersion}"
+                    else
+                      aws s3 cp "${SourceLocation}" repo.tgz
+                      tar --strip-components 1 -xvvzf repo.tgz
+                    fi
+                  - cd ${SourceDirectory}
+              pre_build:
+                commands:
+                  - |
+                    if [ ! -f yarn.lock -a -f package.json ]; then
+                      npm install --production
+                    elif [ -f yarn.lock -a -f package.json ]; then
+                      yarn install --production
+                    elif [ -f requirements.txt ]; then
+                      pip install -r requirements.txt
+                    elif [ -f Gemfile ]; then
+                      bundle install
+                    fi
+              build:
+                commands:
+                  - ${BuildCommand}
+              post_build:
+                commands:
+                  - if [ $CODEBUILD_BUILD_SUCCEEDING == 0 ]; then exit 1; fi
+                  - |
+                    _SOURCE_LOCATION=${SourceLocation}
+                    if [ s3 != "${!_SOURCE_LOCATION%%:*}" ]; then
+                      cd "${!CODEBUILD_SRC_DIR}/repo"
+                    else
+                      cd "${!CODEBUILD_SRC_DIR}"
+                    fi
+                  - aws s3 sync '${PublishDirectory}' 's3://${DestinationBucketName}' --acl public-read --cache-control 'max-age=0, must-revalidate, public' --no-progress --delete
+          - PublishDirectory: website/build/stackery
+            BuildCommand: npm run build
+            SourceDirectory: website
+            DestinationBucketName: !Ref www
+      Tags:
+        - Key: Stackery Project Type
+          Value: Website Builder
+  WebsiteEvents:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source:
+          - aws.codebuild
+        detail-type:
+          - CodeBuild Build State Change
+        detail:
+          build-status:
+            - SUCCEEDED
+            - FAILED
+            - FAULT
+            - STOPPPED
+            - TIMED_OUT
+          project-name:
+            - !Ref Website
+      Targets:
+        - Arn: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:stackery-agent-commander
+          Id: StackeryAgentCommander
+  WebsiteEventsPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn: WebsiteEvents
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:stackery-agent-commander
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt WebsiteEvents.Arn
+  WebsiteRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-Website
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: codebuild.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+        - PolicyName: Logs
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${AWS::StackName}-Website:log-stream:*
+        - PolicyName: DownloadSourceFromStackeryAssetsBucket
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: arn:aws:s3:::stackery-assetsbucket-*/*
+        - PolicyName: UploadToDestinationObjectStore
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:DeleteObject
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource:
+                  - !Sub ${www.Arn}/*
+                  - !Sub ${www.Arn}
+  WebsiteBuildTrigger:
+    Type: Custom::StackeryWebsiteBuildTrigger
+    DependsOn: WebsiteEvents
+    Properties:
+      ServiceToken: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:stackery-agent-commander
+      Type: website
+      ProjectName: !Ref Website
+      SourceVersion: !Ref SourceVersion
+  www:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-www-${AWS::AccountId}
+      WebsiteConfiguration:
+        IndexDocument: index.html
+  Cdn:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        DefaultCacheBehavior:
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          Compress: true
+          TargetOriginId: StackeryCDN
+          ViewerProtocolPolicy: redirect-to-https
+          LambdaFunctionAssociations:
+            - EventType: origin-request
+              LambdaFunctionARN: !GetAtt indexRewrite.VersionArn
+            - EventType: origin-response
+              LambdaFunctionARN: !GetAtt secureHeaders.VersionArn
+        Enabled: true
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_100
+        Origins:
+          - DomainName: !GetAtt www.DomainName
+            Id: StackeryCDN
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub
+                - origin-access-identity/cloudfront/${OriginAccessIdentity}
+                - OriginAccessIdentity: !Ref CdnOriginAccessIdentity
+  CdnOriginAccessIdentity:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: Stackery
+  CdnBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref www
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity ${CdnOriginAccessIdentity}
+            Action: s3:GetObject
+            Resource: !Sub
+              - ${BucketArn}/*
+              - BucketArn: !GetAtt www.Arn
+  runIndexerDeployTrigger:
+    Type: Custom::FunctionDeployTrigger
+    Properties:
+      ServiceToken: !GetAtt runIndexer.Arn
+      DeploymentTimestamp: !Ref DeploymentTimestamp
+  indexRewrite:
+    Type: Custom::StackeryEdgeFunction
+    Properties:
+      ServiceToken: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:stackery-agent-commander
+      FunctionName: !Sub ${AWS::StackName}-indexRewrite
+      Description: !Sub
+        - Stack ${StackTagName} Environment ${EnvironmentTagName} Function ${ResourceName}
+        - ResourceName: indexRewrite
+      CodeUri: functions/indexRewrite
+      Handler: index.handler
+      Runtime: nodejs12.x
+      MemorySize: 128
+      Timeout: 5
+      Tracing: Active
+      Role: !GetAtt indexRewriteRole.Arn
+  indexRewriteRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-indexRewrite
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          Effect: Allow
+          Principal:
+            Service:
+              - lambda.amazonaws.com
+              - edgelambda.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess
+  secureHeaders:
+    Type: Custom::StackeryEdgeFunction
+    Properties:
+      ServiceToken: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:stackery-agent-commander
+      FunctionName: !Sub ${AWS::StackName}-secureHeaders
+      Description: !Sub
+        - Stack ${StackTagName} Environment ${EnvironmentTagName} Function ${ResourceName}
+        - ResourceName: secureHeaders
+      CodeUri: functions/secureHeaders
+      Handler: index.handler
+      Runtime: nodejs12.x
+      MemorySize: 128
+      Timeout: 5
+      Tracing: Active
+      Role: !GetAtt secureHeadersRole.Arn
+  secureHeadersRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-secureHeaders
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          Effect: Allow
+          Principal:
+            Service:
+              - lambda.amazonaws.com
+              - edgelambda.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess
+Parameters:
+  StackTagName:
+    Type: String
+    Description: Stack Name (injected by Stackery at deployment time)
+  EnvironmentTagName:
+    Type: String
+    Description: Environment Name (injected by Stackery at deployment time)
+  EnvConfigAlgoliaAppIdAsString:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /<EnvironmentName>/algoliaAppId
+  DefaultVPCSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: AWS account-specific default VPC subnets (injected by Stackery at deployment time)
+  SourceLocation:
+    Type: String
+    Description: Location of source code for deployment (injected by Stackery at deployment time)
+  SourceVersion:
+    Type: String
+    Description: Source version for deployment (injected by Stackery at deployment time)
+  DeploymentTimestamp:
+    Type: Number
+    Description: Deployment preparation timestamp in milliseconds Since Epoch (injected by Stackery at deployment time)
+Metadata:
+  EnvConfigParameters:
+    EnvConfigAlgoliaAppIdAsString: algoliaAppId
