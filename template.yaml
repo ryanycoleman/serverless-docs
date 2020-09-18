@@ -188,9 +188,9 @@ Resources:
                       cd "${!CODEBUILD_SRC_DIR}"
                     fi
                   - aws s3 sync '${PublishDirectory}' 's3://${DestinationBucketName}' --acl public-read --cache-control 'max-age=0, must-revalidate, public' --no-progress --delete
-          - PublishDirectory: website/build/stackery
-            BuildCommand: npm run build
-            SourceDirectory: website
+          - PublishDirectory: build
+            BuildCommand: npm run-script build
+            SourceDirectory: .
             DestinationBucketName: !Ref www
       Tags:
         - Key: Stackery Project Type
