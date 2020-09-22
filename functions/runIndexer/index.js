@@ -14,15 +14,11 @@ exports.handler = async (event, context) => {
   let url;
 
   try {
-
-    if( process.env.ENV == 'production' ) {
-      url = 'https://docs.stackery.io'
-    } else {
-      url = `http://${process.env.BUCKET_NAME}.s3-website-${process.env.AWS_REGION}.amazonaws.com`
-    }
+    
+    url = `http://${process.env.BUCKET_NAME}.s3-website-${process.env.AWS_REGION}.amazonaws.com`
   
     const config = {
-      "index_name": "stackery",
+      "index_name": "docs",
       "start_urls": [
         url
       ],
